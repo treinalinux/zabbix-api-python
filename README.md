@@ -2,27 +2,57 @@
 
 Esta documentação descreve a arquitetura e os passos de configuração para expor arquivos JSON estáticos locais de dispositivos (storages) para consumo no Zabbix.
 
-A solução utiliza **Python (FastAPI)** operando sob o servidor de aplicação **Gunicorn com Uvicorn** em segundo plano, **NGINX** como proxy reverso com bloqueio de IP, e o **Zabbix HTTP Agent** com cabeçalhos de autenticação.
+A solução utiliza **Python (FastAPI)** operando sob o servidor de aplicação **Gunicorn com Uvicorn** em segundo plano, isolado em um **Virtual Environment (venv)** sob uma **Conta de Serviço**. A borda é protegida pelo **NGINX** atuando como proxy reverso com bloqueio de IP, e a autenticação ocorre via **Zabbix HTTP Agent** com cabeçalhos de segurança.
 
-## 1. Arquitetura e Decisão Tecnológica
+## 1. Arquitetura e Decisões Tecnológicas
 
-* **FastAPI:** Framework moderno e extremamente rápido para criar a rota de leitura dos arquivos estáticos.
+* **FastAPI:** Framework moderno e extremamente rápido para criar a rota de leitura dos arquivos.
+* **Gunicorn + Uvicorn:** O Gunicorn orquestra múltiplos "clones" (workers) do servidor ASGI Uvicorn. Isso garante alta disponibilidade (tolerância a falhas) e distribui a carga da API entre os núcleos da CPU.
+* **Isolamento (VENV e System User):** O uso do `venv` impede conflitos com o Python do SO (crítico em RHEL/CentOS/AlmaLinux). A conta de serviço restringe as permissões da API, garantindo que, em caso de vulnerabilidade, o atacante não obtenha privilégios no servidor.
 
-* **Por que Gunicorn + Uvicorn para Produção?**
-  O *Uvicorn* isolado é um servidor web ASGI ultrarrápido, porém roda em um único processo (single-core). Para um ambiente de **produção tolerante a falhas**, utilizamos o *Gunicorn* como "gerente de processos". O Gunicorn orquestra múltiplos "clones" (workers) do Uvicorn, distribuindo a carga entre os núcleos da CPU do servidor e garantindo que, se um processo travar por qualquer motivo, um novo seja iniciado imediatamente, garantindo estabilidade e alta disponibilidade.
+---
 
-## 2. Desenvolvimento da API (FastAPI)
+## 2. Preparação do Ambiente de Produção
 
-A API atua como um leitor dinâmico em tempo real. Ela recebe a requisição, monta o caminho até a pasta do dispositivo, valida o token de segurança e devolve o conteúdo do arquivo JSON.
+Antes de escrever o código, vamos isolar a aplicação no sistema operacional.
 
-**Dependências:**
+### 2.1. Criar a Conta de Serviço
+
+Crie um usuário de sistema (system account) que não possua diretório home ou permissão de login no terminal.
+
+```bash
+# Cria o usuário 'zabbix_api' sem acesso a shell
+sudo useradd -r -s /bin/false zabbix_api
+```
+
+*(Nota: Certifique-se de que este usuário tenha permissão de **leitura** na pasta onde os JSONs são gerados: `chown -R zabbix_api:zabbix_api /caminho/absoluto/para/app/`)*
+
+### 2.2. Criar e Ativar o Ambiente Virtual (VENV)
+
+Navegue até o diretório onde sua API vai residir e crie o ambiente virtual.
+
+```bash
+cd /caminho/absoluto/para/app/no_api
+python3 -m venv venv
+
+# Ative o ambiente virtual
+source venv/bin/activate
+```
+
+Com o `(venv)` ativado no terminal, instale as dependências. Elas ficarão isoladas nesta pasta.
 
 ```bash
 pip install fastapi uvicorn gunicorn
 ```
 
+---
+
+## 3. Desenvolvimento da API (FastAPI)
+
+A API atua como um leitor dinâmico. Ela recebe a requisição, monta o caminho até a pasta, valida o token de segurança e devolve o conteúdo do arquivo JSON.
+
 **Código Fonte (`main.py`):**
-Crie o arquivo principal da aplicação. Certifique-se de ajustar o diretório apontado em `BASE_PATH`.
+Crie o arquivo principal no mesmo diretório onde você criou a pasta `venv`.
 
 ```python
 import os
@@ -62,9 +92,13 @@ def get_device_json(
     return device_data
 ```
 
-## 3. Configuração do Serviço em Segundo Plano (Systemd)
+*(Após salvar o arquivo, você pode sair do ambiente virtual digitando `deactivate` no terminal).*
 
-Para garantir que a API inicie automaticamente com o sistema operacional e permaneça em execução, configuramos um serviço no Linux gerenciado pelo Systemd utilizando o Gunicorn.
+---
+
+## 4. Configuração do Serviço em Segundo Plano (Systemd)
+
+Agora vamos configurar o serviço para rodar com o nosso usuário dedicado e usar o executável do Gunicorn que está **dentro** do ambiente virtual.
 
 **Criação do arquivo de serviço:**
 
@@ -73,7 +107,6 @@ sudo nano /etc/systemd/system/zabbix-api.service
 ```
 
 **Configuração do Serviço (`zabbix-api.service`):**
-Substitua `seu_usuario` e `/caminho/absoluto/onde/esta/o/main_py` pelos valores reais do seu ambiente. *(Dica: 4 workers são suficientes para o consumo do Zabbix, mas a regra geral é: Número de Cores da CPU x 2 + 1).*
 
 ```ini
 [Unit]
@@ -81,18 +114,21 @@ Description=API Zabbix Leitora de JSON
 After=network.target
 
 [Service]
-User=seu_usuario
-WorkingDirectory=/caminho/absoluto/onde/esta/o/main_py
+# Usa a conta de serviço criada no passo 2.1
+User=zabbix_api
+Group=zabbix_api
 
-# Executa o Gunicorn gerenciando 4 workers do Uvicorn
-ExecStart=/usr/local/bin/gunicorn main:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 127.0.0.1:8000
+# Pasta onde está o main.py
+WorkingDirectory=/caminho/absoluto/para/app/no_api
+
+# Aponta para o Gunicorn DENTRO da pasta venv, orquestrando 4 workers
+ExecStart=/caminho/absoluto/para/app/no_api/venv/bin/gunicorn main:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 127.0.0.1:8000
+
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 ```
-
-*(Nota: Se o Gunicorn estiver instalado em outro caminho, valide usando o comando `which gunicorn` e altere o parâmetro `ExecStart`)*.
 
 **Ativação do Serviço:**
 
@@ -100,11 +136,16 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable zabbix-api
 sudo systemctl start zabbix-api
+
+# Para checar se iniciou corretamente:
+# sudo systemctl status zabbix-api
 ```
 
-## 4. Segurança e Proxy Reverso (NGINX)
+---
 
-O NGINX intercepta as requisições na porta 80, verifica a origem do IP (camada de rede) e encaminha o tráfego autorizado para a API Python na porta 8000. Isso é feito de forma isolada, sem afetar outras aplicações rodando no mesmo servidor.
+## 5. Segurança e Proxy Reverso (NGINX)
+
+O NGINX intercepta as requisições na porta 80, verifica a origem do IP (camada de rede) e encaminha o tráfego autorizado para a API Python na porta 8000. 
 
 **Configuração do Bloco de Servidor (`/etc/nginx/sites-available/default`):**
 
@@ -121,7 +162,6 @@ server {
     # Rota exclusiva para consumo do Zabbix (Protegida)
     location /devices/ {
         # 1. Permite acesso apenas dos IPs autorizados (Zabbix Server/Proxy)
-        # Adicione também o seu IP se quiser testar de fora do servidor
         allow 192.168.1.50; 
         
         # 2. Bloqueia qualquer outro IP com Erro 403 (Forbidden)
@@ -142,70 +182,56 @@ sudo nginx -t
 sudo nginx -s reload
 ```
 
-## 5. Configuração de Coleta no Zabbix
+---
 
-A coleta é realizada através de um item mestre para otimizar as requisições e itens dependentes para gerar o histórico e gráficos, reduzindo o tráfego de rede e o processamento no servidor monitorado.
+## 6. Configuração de Coleta no Zabbix
 
-### 5.1. Item Master (Coletor Principal)
+### 6.1. Item Master (Coletor Principal)
 
-Este item é responsável apenas por bater na API e baixar o JSON bruto temporariamente em memória. Deve ser criado no Template de cada família de equipamentos (ex: `Template Storage Unity`).
+Criado no Template de cada família de equipamentos (ex: `Template Storage Unity`).
 
 * **Name:** `API: Obter dados do equipamento`
 * **Type:** `HTTP agent`
 * **Key:** `api.get_json_data`
 * **URL:** `http://ip_do_seu_nginx/devices/unity/{HOST.NAME}`
 * **Type of information:** `Text`
-* **Update interval:** `5m` (Conforme necessidade de monitoramento)
-* **History storage period:** `0` (Importante: evita armazenamento do JSON inteiro no banco do Zabbix)
+* **Update interval:** `5m`
+* **History storage period:** `0` (Impede o banco de dados de armazenar os JSONs brutos)
 * **Headers:**
   * Name: `x-api-token`
-  * Value: `{$API_TOKEN}` *(Macro definida globalmente ou no template contendo o valor do token configurado na API)*
+  * Value: `{$API_TOKEN}` *(Macro contendo o valor configurado na API)*
 
-### 5.2. Itens Dependentes (Métricas Específicas)
+### 6.2. Itens Dependentes (Métricas Específicas)
 
-Para cada valor numérico ou de texto contido no JSON (CPU, disco, status, etc.), cria-se um item dependente atrelado ao Item Master.
+Para cada métrica, cria-se um item dependente do Item Master.
 
-* **Name:** `CPU Utilization` (Exemplo)
+* **Name:** `CPU Utilization` 
 * **Type:** `Dependent item`
 * **Key:** `unity.cpu.utilization`
 * **Master item:** `API: Obter dados do equipamento`
-* **Type of information:** `Numeric (float)` ou `Text` (conforme o tipo do dado)
+* **Type of information:** `Numeric (float)` ou `Text`
 
-**Aba Preprocessing do Item Dependente:**
-
+**Aba Preprocessing:**
 * **Step:** `JSONPath`
-* **Parameters:** `$.cpu_utilization` (Exemplo: Caminho exato da chave de métrica dentro do arquivo JSON gerado).
-* **Custom on fail:** Ative esta opção e selecione `Discard value`. Isso previne falsos alertas e erros de leitura caso uma chave específica falte pontualmente no arquivo JSON de origem.
+* **Parameters:** `$.cpu_utilization` 
+* **Custom on fail:** Ative e selecione `Discard value`.
 
-## 6. Testando a API (Curl, Postman e Insomnia)
+---
 
-Para garantir que a comunicação e a autenticação estão funcionando antes de configurar o Zabbix, você pode simular requisições. 
+## 7. Testando a API 
 
-> **Atenção:** Como configuramos bloqueio de IP no NGINX, os testes externos só funcionarão se o seu IP atual estiver na lista de `allow` do NGINX, ou se você estiver rodando o teste diretamente de dentro do servidor (via localhost).
+> **Atenção:** Como configuramos bloqueio de IP no NGINX, os testes externos só funcionarão se o seu IP estiver na lista de `allow` do NGINX, ou se o teste for executado diretamente do servidor (localhost).
 
 ### Testando via terminal (cURL)
-Use o parâmetro `-H` para passar o cabeçalho de autenticação:
-
 ```bash
 curl -X GET "http://ip_do_seu_nginx/devices/unity/unityrio001" \
      -H "x-api-token: seu_token_super_secreto_123"
 ```
 
-### Testando via Postman
-1. Crie uma nova requisição clicando em **"+"** ou **"New"**.
-2. Altere o método HTTP para **GET**.
-3. Na barra de URL, insira: `http://ip_do_seu_nginx/devices/unity/unityrio001`
-4. Abaixo da barra de URL, clique na aba **Headers**.
-5. Adicione uma nova linha:
-   * **Key:** `x-api-token`
-   * **Value:** `seu_token_super_secreto_123`
-6. Clique em **Send**. O JSON deve aparecer na aba de "Body" inferior.
-
-### Testando via Insomnia
-1. Pressione **Ctrl+N** (ou Cmd+N) para criar uma nova requisição (New Request).
-2. Dê um nome, defina o método como **GET** e confirme.
-3. Na barra superior, insira a URL: `http://ip_do_seu_nginx/devices/unity/unityrio001`
-4. Na aba **Headers** logo abaixo da URL, adicione:
-   * **Header:** `x-api-token`
-   * **Value:** `seu_token_super_secreto_123`
-5. Clique em **Send** para visualizar o JSON de resposta no painel direito.%
+### Testando via Postman / Insomnia
+1. Crie uma requisição **GET**.
+2. URL: `http://ip_do_seu_nginx/devices/unity/unityrio001`
+3. Aba **Headers**:
+   * Chave: `x-api-token`
+   * Valor: `seu_token_super_secreto_123`
+4. Envie a requisição para validar o retorno do JSON.%
